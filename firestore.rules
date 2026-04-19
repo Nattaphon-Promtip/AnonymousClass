@@ -1,0 +1,117 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: classrooms
+    // Fields: roomCode, instructorId, createdAt, isActive
+    //
+    // Collection: questions
+    // Fields: text, upvotes, createdAt, isSelected, authorId, classroomId
+    //
+    // Collection: votes
+    // Fields: userId, questionId, classroomId
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isInstructor() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'instructor' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+        (request.auth.token.email == "6831503045@lamduan.mfu.ac.th" && request.auth.token.email_verified == true)
+      );
+    }
+
+    function isGlobalInstructor() {
+      return isAuthenticated() && request.auth.token.email == "6831503045@lamduan.mfu.ac.th" && request.auth.token.email_verified == true;
+    }
+
+    function isInstructorOfClassroom(classroomId) {
+      return isAuthenticated() && get(/databases/$(database)/documents/classrooms/$(classroomId)).data.instructorId == request.auth.uid;
+    }
+
+    function isClassroomActive(classroomId) {
+      let classroom = get(/databases/$(database)/documents/classrooms/$(classroomId)).data;
+      return classroom.isActive == true || classroom.roomCode == "DEMO01";
+    }
+
+    function isDemoRoom(classroomId) {
+      return get(/databases/$(database)/documents/classrooms/$(classroomId)).data.roomCode == "DEMO01";
+    }
+
+    function isValidQuestion(data) {
+      return data.keys().hasAll(['text', 'upvotes', 'createdAt', 'isSelected', 'authorId', 'classroomId']) &&
+             data.text is string && data.text.size() > 0 && data.text.size() <= 300 &&
+             data.upvotes == 0 &&
+             data.createdAt is timestamp &&
+             data.isSelected == false &&
+             data.authorId == request.auth.uid &&
+             data.classroomId is string &&
+             isClassroomActive(data.classroomId);
+    }
+
+    function isValidVote(data, questionId) {
+      return data.keys().hasAll(['userId', 'questionId', 'classroomId']) &&
+             data.userId == request.auth.uid &&
+             data.questionId == questionId &&
+             isClassroomActive(data.classroomId);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /classrooms/{classroomId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (
+                      (isInstructor() && request.resource.data.instructorId == request.auth.uid) ||
+                      (request.resource.data.roomCode == "DEMO01")
+                    ) && request.resource.data.isActive == true;
+      allow update: if isInstructor() && resource.data.instructorId == request.auth.uid;
+    }
+
+    match /questions/{questionId} {
+      allow read: if isAuthenticated();
+      
+      // Allow students OR instructor in demo room to create questions
+      allow create: if isAuthenticated() && (!isInstructor() || isDemoRoom(request.resource.data.classroomId)) && isValidQuestion(request.resource.data);
+
+      allow update: if isAuthenticated() && (
+        // Upvote logic: Allow students OR instructor in demo room
+        ((!isInstructor() || isDemoRoom(resource.data.classroomId)) && 
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['upvotes']) &&
+         request.resource.data.upvotes == resource.data.upvotes + 1 &&
+         existsAfter(/databases/$(database)/documents/votes/$(request.auth.uid + '_' + questionId))) ||
+        // Instructor selection and answering logic
+        (isInstructor() && 
+         (isGlobalInstructor() || get(/databases/$(database)/documents/classrooms/$(resource.data.classroomId)).data.instructorId == request.auth.uid) &&
+         request.resource.data.diff(resource.data).affectedKeys().hasAny(['isSelected', 'isAnswered', 'answeredAt', 'answeredBy', 'answer']))
+      );
+
+      allow delete: if isGlobalInstructor() || isInstructorOfClassroom(resource.data.classroomId) || (isAuthenticated() && resource.data.authorId == request.auth.uid);
+    }
+
+    match /votes/{voteId} {
+      allow read: if isAuthenticated() && request.auth.uid == resource.data.userId;
+      allow create: if isAuthenticated() && (!isInstructor() || isDemoRoom(request.resource.data.classroomId)) &&
+                    voteId == request.auth.uid + '_' + request.resource.data.questionId &&
+                    isValidVote(request.resource.data, request.resource.data.questionId);
+      allow update, delete: if false;
+    }
+
+    match /users/{userId} {
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      allow write: if false;
+    }
+  }
+}
